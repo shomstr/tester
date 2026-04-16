@@ -11,6 +11,9 @@ COPY . /app
 # Проставляем PYTHONPATH, чтобы импорты 'shop_bot' из папки src не ломались
 ENV PYTHONPATH="/app"
 
+# Отключаем буферизацию Python, чтобы логи 바로 появлялись в docker logs
+ENV PYTHONUNBUFFERED=1
+
 # Порт, на котором работает локальный Flask сервер
 EXPOSE 8080
 

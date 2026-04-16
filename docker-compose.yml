@@ -6,5 +6,5 @@ services:
       context: .
     container_name: garant-api-server
     ports:
-      - "8080:8080"
+      - "8087:8080"
     restart: always
