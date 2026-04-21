@@ -22,9 +22,6 @@ VLESS_SOURCES = [
     "https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/2.txt",
     "https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/3.txt",
     "https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/4.txt",
-    # mehdirzfx агрегатор
-    "https://raw.githubusercontent.com/mehdirzfx/v2ray-sub/main/vless.txt",
-    "https://raw.githubusercontent.com/mehdirzfx/v2ray-sub/main/reality.txt",
 ]
 
 # URL для проверки реального VPN-соединения.
@@ -316,83 +313,131 @@ def _fetch_links_from_sources() -> list[str]:
     """
     Скачивает VLESS ссылки из всех источников (VLESS_SOURCES).
     Возвращает дедуплицированный список (по host:port+uuid).
-    Фильтрует: только vless://, без xhttp (плохо поддерживается клиентами).
+    Фильтрует: только vless://, без xhttp (п�
+# ─── Константы отбора ────────────────────────────────────────────────────────
+
+# Максимум рабочих ссылок в пуле
+TOP_LINKS_MAX = 10
+# Ссылки с ping > best_ping * PING_RATIO_THRESHOLD отбрасываются как "медленные"
+PING_RATIO_THRESHOLD = 2.5
+
+
+def get_top_links(local_only: bool = False) -> list[str]:
     """
-    all_links: list[str] = []
-    seen_keys: set[str] = set()
+    Скачивает VLESS конфиги из всех источников, тестирует параллельно
+    через xray-core (реальный VPN) и возвращает до TOP_LINKS_MAX лучших.
 
-    for url in VLESS_SOURCES:
-        try:
-            resp = requests.get(url, timeout=8)
-            resp.raise_for_status()
-            lines = [
-                line.strip()
-                for line in resp.text.splitlines()
-                if line.strip().startswith('vless://')
-            ]
-            # Фильтруем xhttp (не поддерживается большинством клиентов)
-            lines = [l for l in lines if 'type=xhttp' not in l]
-
-            added = 0
-            for link in lines:
-                # Дедупликация по uuid@host:port (без параметров и имени)
-                m = re.match(r'vless://([^@]+)@([^:]+):(\d+)', link)
-                if m:
-                    key = f"{m.group(1)}@{m.group(2)}:{m.group(3)}"
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        all_links.append(link)
-                        added += 1
-            logger.info(f"Source [{url.split('/')[-1]}]: +{added} unique links")
-        except Exception as e:
-            logger.warning(f"Failed to fetch from {url}: {e}")
-
-    logger.info(f"Total unique VLESS links fetched: {len(all_links)}")
-    return all_links
-
-
-# ─── Главная функция ──────────────────────────────────────────────────────────
-
-def update_server_garant_link(local_only: bool = False) -> str | None:
-    """
-    Скачивает VLESS конфиги из всех источников, тестирует их параллельно
-    через xray-core (реальное VPN соединение) и возвращает лучший линк.
-
-    Если GARANT_API_URL задан и local_only=False — запрашивает у внешнего API.
-    Если xray не найден — делает fallback на TCP ping.
+    Логика фильтрации:
+      - Все рабочие ссылки сортируются по latency (лучший пинг первый).
+      - Ссылки с ping > best_ping * PING_RATIO_THRESHOLD отбрасываются.
+      - Берём до TOP_LINKS_MAX (10) оставшихся.
+      - Имя ссылки: "🛡️ Обход Гарант N" (нумерация чтобы клиент не сливал в одну).
     """
     if not local_only:
         api_url = os.getenv("GARANT_API_URL")
         if api_url:
-            logger.info(f"Fetching Server Garant link from API: {api_url}")
+            logger.info(f"Fetching from API: {api_url}")
             try:
                 target_url = api_url if api_url.endswith('/') else api_url + '/'
                 response = requests.get(target_url, timeout=15)
                 response.raise_for_status()
                 data = response.json()
                 if "link" in data and data["link"]:
-                    return data["link"]
-                else:
-                    logger.warning(f"Invalid response from API: {response.text}")
-                    return None
+                    return [data["link"]]
+                logger.warning(f"Invalid API response: {response.text}")
+                return []
             except Exception as e:
                 logger.error(f"Failed to fetch from API: {e}", exc_info=True)
-                return None
+                return []
 
     # Выбираем стратегию тестирования.
     # RAM расчёт: xray процесс ~40 МБ × 200 воркеров = ~8 ГБ (из 10 ГБ).
     # TCP fallback — только сокеты, 500 потоков ≈ ~200 МБ.
     if XRAY_BINARY:
         test_fn = _test_link_via_xray
-        mode = "xray (real VPN test)"
+        mode = f"xray real VPN test ({XRAY_BINARY})"
         max_workers = 200  # ~40 МБ × 200 = ~8 ГБ RAM
     else:
         test_fn = _test_link_tcp_fallback
-        mode = "TCP ping (fallback, xray not found)"
+        mode = "TCP ping (fallback)"
         max_workers = 500
-        logger.warning("xray binary not found! Falling back to TCP ping only.")
+        logger.warning("xray not found — falling back to TCP ping")
 
-    logger.info(f"Starting VPN link check. Mode: {mode}")
+    logger.info(f"Starting check. Mode: {mode}, max_links: {TOP_LINKS_MAX}")
+
+    try:
+        lines = _fetch_links_from_sources()
+        if not lines:
+            logger.warning("No VLESS links fetched from any source.")
+            return []
+
+        def _test_with_idx(args):
+            idx, link = args
+            return test_fn(link, idx)  # правильный порядок!
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(_test_with_idx, enumerate(lines)))
+
+        # Собираем все рабочие пары (ping, link)
+        working: list[tuple[float, str]] = [
+            (ping, link)
+            for link, ping in results
+            if link is not None
+        ]
+        working.sort(key=lambda x: x[0])  # лучшие (низкий пинг) первые
+
+        if not working:
+            logger.warning(f"No working links out of {len(lines)} [{mode}].")
+            return []
+
+        best_ping = working[0][0]
+        # Фильтр: убираем ссылки с пингом сильно хуже лучшего
+        ping_cutoff = best_ping * PING_RATIO_THRESHOLD
+        filtered = [(p, l) for p, l in working if p <= ping_cutoff]
+
+        top = filtered[:TOP_LINKS_MAX]
+
+        result_links = []
+        for i, (ping, link) in enumerate(top, start=1):
+            clean = link.split('#')[0]
+            suffix = f"🛡️ Обход Гарант" if i == 1 else f"🛡️ Обход Гарант {i}"
+            result_links.append(f"{clean}#{suffix}")
+
+        logger.info(
+            f"Done [{mode}]. Tested: {len(lines)}, "
+            f"Working: {len(working)}, Filtered (ping≤{ping_cutoff:.0f}ms): {len(filtered)}, "
+            f"Top-{len(top)}: best={best_ping:.0f}ms, worst={top[-1][0]:.0f}ms"
+        )
+        return result_links
+
+    except Exception as e:
+        logger.error(f"get_top_links error: {e}", exc_info=True)
+        return []
+
+
+def update_server_garant_link(local_only: bool = False) -> str | None:
+    """
+    Обратная совместимость: возвращает лучшую одну ссылку.
+    Используется старым кодом shopbot'а напрямую (scheduler, key_manager).
+    """
+    links = get_top_links(local_only=local_only)
+    return links[0] if links else None
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    logger.info(f"xray binary: {XRAY_BINARY or 'NOT FOUND (TCP fallback)'}")
+
+    top = get_top_links(local_only=True)
+    print(f"\n{'='*60}")
+    print(f"Top-{len(top)} links:")
+    for i, l in enumerate(top, 1):
+        print(f"  {i}. {l[:100]}")
+    print(f"{'='*60}")
+gger.info(f"Starting VPN link check. Mode: {mode}")
 
     try:
         lines = _fetch_links_from_sources()

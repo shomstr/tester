@@ -22,26 +22,37 @@ API_URL = f"https://{SERVER_IP}:{PORT}/api/update_garant"
 
 def push_loop():
     print("="*60)
-    print(f"🚀 ТЕСТЕР ОБХОД-ГАРАНТ ЗАПУЩЕН")
+    print(f"🚀 ТЕСТЕР ОБХОД-ГАРАНТ ЗАПУЩЕН (мульти-ссылки)")
     print(f"🎯 Главный сервер для отправки: {API_URL}")
     print("="*60)
-    
+
     # Отключаем предупреждения InsecureRequestWarning, если стучимся по IP вместо домена
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    
-    # We use local_only=True so it fetches correctly within the checker script logic
+
+    import socket
+    tester_id = os.getenv("TESTER_NAME", socket.gethostname())
+
     while True:
         print(f"\n[{time.strftime('%H:%M:%S')}] Начало проверки серверов...")
         try:
-            best_link = update_server_garant_link(local_only=True)
-            if best_link:
-                import socket
-                tester_id = os.getenv("TESTER_NAME", socket.gethostname())
-                print(f"[{time.strftime('%H:%M:%S')}] Найден лучший сервер. Отправляем от имени {tester_id} на {API_URL}...")
+            top_links = update_server_garant_link(local_only=True)
+            if top_links:
+                print(f"[{time.strftime('%H:%M:%S')}] Найдено {len(top_links)} рабочих серверов:")
+                for i, item in enumerate(top_links, 1):
+                    print(f"  #{i} [{item['ping_ms']:.0f}ms] {item['link'][:80]}...")
+
+                # Новый формат: список ссылок с пингом
+                # Поле `link` оставляем для backward compat (лучшая ссылка)
+                payload = {
+                    "tester_id": tester_id,
+                    "link": top_links[0]["link"],   # compat: лучшая ссылка
+                    "links": top_links,              # новый формат: топ-N с пингами
+                }
+                print(f"[{time.strftime('%H:%M:%S')}] Отправляем {len(top_links)} ссылок от [{tester_id}] на {API_URL}...")
                 response = requests.post(
-                    API_URL, 
-                    json={"link": best_link, "tester_id": tester_id},
+                    API_URL,
+                    json=payload,
                     timeout=10,
                     verify=False  # разрешаем игнорировать ошибку сертификата при обращении по IP
                 )
@@ -54,7 +65,7 @@ def push_loop():
         except Exception as e:
             print(f"❌ Критическая ошибка в цикле:")
             traceback.print_exc()
-            
+
         print("\nОжидание 3 минуты перед следующей проверкой...")
         time.sleep(180)
 
