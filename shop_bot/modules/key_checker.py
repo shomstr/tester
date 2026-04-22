@@ -15,13 +15,19 @@ logger = logging.getLogger(__name__)
 
 # ─── Список источников конфигов ───────────────────────────────────────────────
 VLESS_SOURCES = [
-    # Основной источник (igareck) — белые списки для России
+    # Основной источник (igareck) — прямо + через зеркало
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
-    # FreeProxyList (nikita29a) — Reality / Hysteria2
+    "https://ghproxy.net/https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
+    # FreeProxyList (nikita29a) — прямо
     "https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/1.txt",
     "https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/2.txt",
     "https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/3.txt",
     "https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/4.txt",
+    # FreeProxyList (nikita29a) — через зеркало ghproxy.net (РФ fallback)
+    "https://ghproxy.net/https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/1.txt",
+    "https://ghproxy.net/https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/2.txt",
+    "https://ghproxy.net/https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/3.txt",
+    "https://ghproxy.net/https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/4.txt",
 ]
 
 # URL для проверки реального VPN-соединения.
