@@ -3,71 +3,72 @@ import codecs
 import time
 import requests
 import traceback
+import logging
 import os
-from shop_bot.modules.key_checker import update_server_garant_link
+import urllib3
+from shop_bot.modules.key_checker import GarantBalancer, XRAY_BINARY
 
-# Override stdout to handle cp1251 problems in Windows terminal
+# Отключаем предупреждения сертификатов
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Исправление кодировки консоли (для Windows)
 if hasattr(sys.stdout, 'encoding') and sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
-    try:
-        sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
-    except Exception:
-        pass
+    try: sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
+    except: pass
 
-# The target server URL where the main shop_bot is running.
-# Если есть домен (например hestiagate.ru), то лучше писать его вместо IP.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# Конфигурация API
 SERVER_IP = os.getenv("TARGET_SERVER", "72.56.100.12")
-# Nginx слушает 443 порт и сам перекидывает на 1488 внутрь докера:
 PORT = os.getenv("TARGET_PORT", "443")
 API_URL = f"https://{SERVER_IP}:{PORT}/api/update_garant"
+TESTER_ID = os.getenv("TESTER_NAME", socket.gethostname() if hasattr(socket, 'gethostname') else "unknown-tester")
 
-def push_loop():
-    print("="*60)
-    print(f"🚀 ТЕСТЕР ОБХОД-ГАРАНТ ЗАПУЩЕН (мульти-ссылки)")
-    print(f"🎯 Главный сервер для отправки: {API_URL}")
-    print("="*60)
+def reporter_loop():
+    logger.info("="*60)
+    logger.info("🚀 ТЕСТЕР ОБХОД-ГАРАНТ (STATEFUL) ЗАПУЩЕН")
+    logger.info(f"🎯 Главный сервер для отправки: {API_URL}")
+    logger.info(f"📡 Xray Binary: {XRAY_BINARY}")
+    logger.info("="*60)
 
-    # Отключаем предупреждения InsecureRequestWarning, если стучимся по IP вместо домена
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    if not XRAY_BINARY:
+        logger.error("❌ Xray не найден! Тестер не может работать.")
+        sys.exit(1)
 
-    import socket
-    tester_id = os.getenv("TESTER_NAME", socket.gethostname())
+    # Инициализируем и запускаем фоновые потоки
+    balancer = GarantBalancer()
+    balancer.start()
 
     while True:
-        print(f"\n[{time.strftime('%H:%M:%S')}] Начало проверки серверов...")
         try:
-            top_links = update_server_garant_link(local_only=True)
-            if top_links:
-                print(f"[{time.strftime('%H:%M:%S')}] Найдено {len(top_links)} рабочих серверов:")
-                for i, item in enumerate(top_links, 1):
-                    print(f"  #{i} [{item['ping_ms']:.0f}ms] {item['link'][:80]}...")
-
-                # Новый формат: список ссылок с пингом
-                # Поле `link` оставляем для backward compat (лучшая ссылка)
+            payload_links = balancer.get_api_payload()
+            
+            if payload_links:
+                logger.info(f"Отправляем {len(payload_links)} активных серверов от [{TESTER_ID}] на {API_URL}...")
+                
                 payload = {
-                    "tester_id": tester_id,
-                    "link": top_links[0]["link"],   # compat: лучшая ссылка
-                    "links": top_links,              # новый формат: топ-N с пингами
+                    "tester_id": TESTER_ID,
+                    "link": payload_links[0]["link"],  # Совместимость с прошлой логикой
+                    "links": payload_links,             # Топ-10 массив
                 }
-                print(f"[{time.strftime('%H:%M:%S')}] Отправляем {len(top_links)} ссылок от [{tester_id}] на {API_URL}...")
-                response = requests.post(
-                    API_URL,
-                    json=payload,
-                    timeout=10,
-                    verify=False  # разрешаем игнорировать ошибку сертификата при обращении по IP
-                )
+                
+                response = requests.post(API_URL, json=payload, timeout=10, verify=False)
+                
                 if response.status_code == 200:
-                    print(f"✅ Успешно обновлено на сервере! (ответ: {response.text})")
+                    logger.info("✅ Успешно обновлено на сервере!")
                 else:
-                    print(f"❌ Ошибка отправки на сервер: HTTP {response.status_code} - {response.text}")
+                    logger.error(f"❌ Ошибка отправки: HTTP {response.status_code} - {response.text}")
             else:
-                print("❌ Не найдено ни одного рабочего сервера.")
+                logger.warning("Ожидание серверов... (Пулы пусты, идет стресс-тест)")
+
         except Exception as e:
-            print(f"❌ Критическая ошибка в цикле:")
+            logger.error(f"❌ Критическая ошибка в цикле: {e}")
             traceback.print_exc()
 
-        print("\nОжидание 3 минуты перед следующей проверкой...")
-        time.sleep(180)
+        # Ожидание перед следующей отправкой отчета на основной сервер
+        time.sleep(180) 
 
 if __name__ == "__main__":
-    push_loop()
+    import socket
+    reporter_loop()
