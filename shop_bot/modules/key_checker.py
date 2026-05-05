@@ -8,6 +8,7 @@ import json
 import tempfile
 import subprocess
 import threading
+import random
 from queue import Queue
 from urllib.parse import unquote
 
@@ -19,14 +20,18 @@ VLESS_SOURCES = [
     "https://github.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/blob/main/vpn-lte/best_keys.txt",
     "https://github.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/blob/main/vpn-lte/good_keys.txt",
     "https://github.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/blob/main/vpn-lte/subscriptions/1sub.txt",
-
 ]
 
-TARGET_ACTIVE_COUNT = 10     # Сколько серверов держать в Активе
-MAX_STRESS_WORKERS = 35      # Одновременные тесты для резерва (чтобы не забить канал)
-STRESS_TEST_DURATION = 25    # Секунд загрузки для прохождения стресс-теста
+TARGET_ACTIVE_COUNT = 12
+MAX_STRESS_WORKERS = 40
+STRESS_TEST_DURATION = 35
+MIN_ACCEPTABLE_SPEED_MBPS = 55
 
-# ─── ПОРТЫ И GEOIP ───────────────────────────────────────────────────────────
+# Пороги для "Супер Гарант ⚡"
+SUPER_SPEED_MBPS = 130
+SUPER_LOW_PING_MS = 180
+
+# ─── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────
 _port_counter_lock = threading.Lock()
 _port_counter = 21000
 
@@ -38,7 +43,8 @@ def _get_next_port() -> int:
         return port
 
 def _iso_to_flag(cc: str) -> str:
-    if not cc or len(cc) != 2: return "🌐"
+    if not cc or len(cc) != 2:
+        return "🌐"
     return chr(0x1F1E6 + ord(cc[0].upper()) - ord('A')) + chr(0x1F1E6 + ord(cc[1].upper()) - ord('A'))
 
 def _get_country(ip: str) -> tuple[str, str]:
@@ -49,22 +55,24 @@ def _get_country(ip: str) -> tuple[str, str]:
     except:
         return "??", "🌐"
 
-# ─── ФУНКЦИИ XRAY ────────────────────────────────────────────────────────────
 def _find_xray_binary() -> str | None:
     for c in ["xray", "/usr/local/bin/xray", "/usr/bin/xray", "/app/xray", "./xray"]:
         try:
-            if subprocess.run([c, "version"], capture_output=True, timeout=3).returncode == 0: 
+            if subprocess.run([c, "version"], capture_output=True, timeout=3).returncode == 0:
                 return c
-        except: continue
+        except:
+            continue
     return None
 
 XRAY_BINARY = _find_xray_binary()
 
+
 def _parse_vless_to_xray_config(link: str, socks_port: int) -> dict | None:
-    """Парсер ссылки в конфиг (полная версия)"""
+    """Парсер VLESS ссылки в конфиг Xray"""
     try:
         m = re.match(r'vless://([^@]+)@([^:]+):(\d+)\??([^#]*)', link)
-        if not m: return None
+        if not m:
+            return None
 
         uuid, host, port, raw_params = m.group(1), m.group(2), int(m.group(3)), m.group(4)
         params = dict(part.split('=', 1) for part in raw_params.split('&') if '=' in part)
@@ -78,23 +86,30 @@ def _parse_vless_to_xray_config(link: str, socks_port: int) -> dict | None:
         if security == 'reality':
             stream["security"] = "reality"
             stream["realitySettings"] = {
-                "serverName": sni, "fingerprint": params.get('fp', 'chrome'),
-                "publicKey": params.get('pbk', ''), "shortId": params.get('sid', ''),
+                "serverName": sni,
+                "fingerprint": params.get('fp', 'chrome'),
+                "publicKey": params.get('pbk', ''),
+                "shortId": params.get('sid', ''),
                 "spiderX": params.get('spx', '/')
             }
         elif security == 'tls':
             stream["security"] = "tls"
             tls_cfg = {"serverName": sni, "allowInsecure": params.get('insecure', '0') in ('1', 'true')}
-            if params.get('alpn'): tls_cfg["alpn"] = [a.strip() for a in params.get('alpn').split(',')]
+            if params.get('alpn'):
+                tls_cfg["alpn"] = [a.strip() for a in params.get('alpn').split(',')]
             stream["tlsSettings"] = tls_cfg
-        else:
-            stream["security"] = "none"
 
-        if network == 'ws': stream["wsSettings"] = {"path": params.get('path', '/'), "headers": {"Host": params.get('host', host)}}
-        elif network == 'grpc': stream["grpcSettings"] = {"serviceName": params.get('serviceName', params.get('spx', '')), "multiMode": params.get('mode', 'gun') == 'multi'}
+        if network == 'ws':
+            stream["wsSettings"] = {"path": params.get('path', '/'), "headers": {"Host": params.get('host', host)}}
+        elif network == 'grpc':
+            stream["grpcSettings"] = {
+                "serviceName": params.get('serviceName', params.get('spx', '')),
+                "multiMode": params.get('mode', 'gun') == 'multi'
+            }
 
         user = {"id": uuid, "encryption": "none"}
-        if params.get('flow'): user["flow"] = params.get('flow')
+        if params.get('flow'):
+            user["flow"] = params.get('flow')
 
         return {
             "log": {"loglevel": "none"},
@@ -105,7 +120,8 @@ def _parse_vless_to_xray_config(link: str, socks_port: int) -> dict | None:
         logger.debug(f"Ошибка парсинга VLESS: {e}")
         return None
 
-# ─── КЛАСС ПРОКСИ (УПРАВЛЕНИЕ ПРОЦЕССОМ) ─────────────────────────────────────
+
+# ─── КЛАСС ПРОКСИ ───────────────────────────────────────────────────────────
 class ProxyInstance:
     def __init__(self, link: str):
         self.raw_link = link
@@ -118,32 +134,44 @@ class ProxyInstance:
         self.host = m.group(1) if m else "unknown"
         self.cc, self.flag = "??", "🌐"
         self.ping_ms = 999.0
+        self.speed_mbps = 0.0
+        self.is_super = False
 
     def start(self) -> bool:
         config = _parse_vless_to_xray_config(self.base_link, self.port)
-        if not config: return False
+        if not config:
+            return False
         
         fd, self.cfg_file = tempfile.mkstemp(suffix='.json', prefix='xray_cfg_')
-        with os.fdopen(fd, 'w') as f: json.dump(config, f)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(config, f)
         
-        self.process = subprocess.Popen([XRAY_BINARY, 'run', '-c', self.cfg_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.process = subprocess.Popen([XRAY_BINARY, 'run', '-c', self.cfg_file],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1.5)
         return self.process.poll() is None
 
     def stop(self):
         if self.process:
-            try: self.process.terminate(); self.process.wait(timeout=2)
-            except: 
-                try: self.process.kill()
-                except: pass
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except:
+                try:
+                    self.process.kill()
+                except:
+                    pass
         if self.cfg_file and os.path.exists(self.cfg_file):
-            try: os.unlink(self.cfg_file)
-            except: pass
+            try:
+                os.unlink(self.cfg_file)
+            except:
+                pass
 
     def get_proxies_dict(self):
         return {"http": f"socks5h://127.0.0.1:{self.port}", "https": f"socks5h://127.0.0.1:{self.port}"}
 
-# ─── БАЛАНСИРОВЩИК ───────────────────────────────────────────────────────────
+
+# ─── ГЛАВНЫЙ БАЛАНСИРОВЩИК ─────────────────────────────────────────────────
 class GarantBalancer:
     def __init__(self):
         self.active_pool: list[ProxyInstance] = []
@@ -151,7 +179,7 @@ class GarantBalancer:
         self.untested_queue = Queue()
         self.lock = threading.Lock()
         self.seen_hosts = set()
-        self.max_queue_size = 1500
+        self.max_queue_size = 1800
 
     def run_scraper(self):
         while True:
@@ -159,20 +187,35 @@ class GarantBalancer:
             new_count = 0
             for url in VLESS_SOURCES:
                 try:
-                    resp = requests.get(url, timeout=10)
+                    resp = requests.get(url, timeout=12)
                     for line in resp.text.splitlines():
                         line = line.strip()
-                        if line.startswith('vless://') and 'type=xhttp' not in line:
-                            m = re.match(r'vless://[^@]+@([^:]+):(\d+)', line)
-                            if m and m.group(1) not in self.seen_hosts:
-                                self.seen_hosts.add(m.group(1))
-                                self.untested_queue.put(line)
-                                new_count += 1
+                        if not line.startswith('vless://') or 'type=xhttp' in line:
+                            continue
+
+                        m = re.match(r'vless://[^@]+@([^:]+):(\d+)', line)
+                        if not m:
+                            continue
+                        hostport = f"{m.group(1)}:{m.group(2)}"
+                        
+                        if hostport not in self.seen_hosts:
+                            self.seen_hosts.add(hostport)
+                            self.untested_queue.put(line)
+                            new_count += 1
                 except Exception as e:
                     logger.warning(f"Ошибка парсинга {url}: {e}")
-            
-            logger.info(f"[Scraper] В очередь добавлено {new_count} новых хостов.")
-            time.sleep(600) # Раз в 10 минут
+
+            logger.info(f"[Scraper] В очередь добавлено {new_count} новых хостов. В очереди: {self.untested_queue.qsize()}")
+
+            # Очистка очереди
+            while self.untested_queue.qsize() > self.max_queue_size:
+                try:
+                    self.untested_queue.get_nowait()
+                    self.untested_queue.task_done()
+                except:
+                    break
+
+            time.sleep(600)
 
     def _stress_test_worker(self):
         while True:
@@ -183,32 +226,51 @@ class GarantBalancer:
                 instance.stop()
                 self.untested_queue.task_done()
                 continue
-                
+
             # Стресс-тест
-            test_url = "https://speed.hetzner.de/100MB.bin" 
+            test_url = "https://speed.hetzner.de/100MB.bin"
             start_time = time.time()
+            downloaded = 0
             is_stable = False
-            
+
             try:
-                with requests.get(test_url, proxies=instance.get_proxies_dict(), stream=True, timeout=8) as r:
+                with requests.get(test_url, proxies=instance.get_proxies_dict(), stream=True, timeout=12) as r:
                     r.raise_for_status()
-                    for chunk in r.iter_content(chunk_size=16384):
-                        if not chunk: break
-                        if time.time() - start_time >= STRESS_TEST_DURATION:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if not chunk:
+                            break
+                        downloaded += len(chunk)
+                        elapsed = time.time() - start_time
+                        
+                        if elapsed >= STRESS_TEST_DURATION:
                             is_stable = True
+                            break
+                        if elapsed > 12 and (downloaded / elapsed / 125000) < 30:
                             break
             except Exception:
                 pass
-            
+
             if is_stable:
-                try: ip = socket.gethostbyname(instance.host)
-                except: ip = "127.0.0.1"
-                instance.cc, instance.flag = _get_country(ip)
-                instance.ping_ms = (time.time() - start_time) * 1000 / STRESS_TEST_DURATION 
+                speed_mbps = (downloaded / (time.time() - start_time)) / 125000
+                instance.speed_mbps = speed_mbps
                 
-                with self.lock:
-                    self.reserve_pool.append(instance)
-                logger.info(f"✅ Успех (Резерв+): {instance.flag} {instance.cc} | {instance.host}")
+                if speed_mbps >= MIN_ACCEPTABLE_SPEED_MBPS:
+                    try:
+                        ip = socket.gethostbyname(instance.host)
+                        instance.cc, instance.flag = _get_country(ip)
+                    except:
+                        pass
+                    
+                    instance.ping_ms = (time.time() - start_time) * 1000 / STRESS_TEST_DURATION
+                    instance.is_super = (speed_mbps >= SUPER_SPEED_MBPS and instance.ping_ms <= SUPER_LOW_PING_MS)
+                    
+                    with self.lock:
+                        self.reserve_pool.append(instance)
+                    
+                    super_mark = "⚡ " if instance.is_super else ""
+                    logger.info(f"✅ {super_mark}Гарант+ {instance.flag} {instance.cc} | {speed_mbps:.1f} Mbps | {instance.host}")
+                else:
+                    instance.stop()
             else:
                 instance.stop()
                 
@@ -218,40 +280,46 @@ class GarantBalancer:
         while True:
             with self.lock:
                 alive_active = []
-                for p in self.active_pool:
+                for p in self.active_pool[:]:
                     try:
                         start = time.time()
-                        # Легкий Health Check
-                        requests.get("https://api.telegram.org", proxies=p.get_proxies_dict(), timeout=4)
+                        requests.get("https://api.telegram.org", proxies=p.get_proxies_dict(), timeout=5)
                         p.ping_ms = (time.time() - start) * 1000
                         alive_active.append(p)
                     except:
-                        logger.warning(f"❌ Сервер упал: {p.host}. Удаляем из Актива.")
+                        logger.warning(f"❌ Упал: {p.host}")
                         p.stop()
                 
                 self.active_pool = alive_active
-                
-                # Добираем из резерва
+
                 while len(self.active_pool) < TARGET_ACTIVE_COUNT and self.reserve_pool:
                     new_server = self.reserve_pool.pop(0)
                     self.active_pool.append(new_server)
-                    logger.info(f"🔄 Восполнение Актива: добавлен {new_server.host} из резерва.")
-                    
-            time.sleep(10)
+                    logger.info(f"🔄 Добавлен в актив: {new_server.host}")
+            
+            time.sleep(15)
 
     def get_api_payload(self) -> list[dict]:
         with self.lock:
-            if not self.active_pool: return []
+            if not self.active_pool:
+                return []
             
             pool = sorted(self.active_pool, key=lambda x: x.ping_ms)
+            random.shuffle(pool)
+
             result = []
             for i, p in enumerate(pool, 1):
-                name = f"🛡️ Обход Гарант {i} {p.flag}"
+                if p.is_super:
+                    name = f"⚡ Супер Гарант {i} {p.flag}"
+                else:
+                    name = f"🛡️ Обход Гарант {i} {p.flag}"
+                
                 result.append({
                     "link": f"{p.base_link}#{name}",
                     "ping_ms": round(p.ping_ms, 1),
                     "country": p.cc,
                     "flag": p.flag,
+                    "is_super": p.is_super
                 })
             return result
 
@@ -260,3 +328,15 @@ class GarantBalancer:
         for _ in range(MAX_STRESS_WORKERS):
             threading.Thread(target=self._stress_test_worker, daemon=True).start()
         threading.Thread(target=self.run_health_watcher, daemon=True).start()
+        logger.info("🚀 Garant Balancer с ⚡ Супер Гарант запущен")
+
+
+# Запуск
+if __name__ == "__main__":
+    balancer = GarantBalancer()
+    balancer.start()
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        logger.info("Остановка тестера...")
