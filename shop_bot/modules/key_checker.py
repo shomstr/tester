@@ -16,10 +16,6 @@ logger = logging.getLogger(__name__)
 # ─── КОНФИГУРАЦИЯ ────────────────────────────────────────────────────────────
 VLESS_SOURCES = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
-    "https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/1.txt",
-    "https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/2.txt",
-    "https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/3.txt",
-    "https://raw.githubusercontent.com/nikita29a/FreeProxyList/main/mirror/4.txt",
     "https://github.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/blob/main/vpn-lte/best_keys.txt",
     "https://github.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/blob/main/vpn-lte/good_keys.txt",
     "https://github.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/blob/main/vpn-lte/subscriptions/1sub.txt",
