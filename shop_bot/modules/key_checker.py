@@ -26,8 +26,8 @@ VLESS_SOURCES = [
 
 ]
 
-TARGET_ACTIVE_COUNT = 25     # Сколько серверов держать в Активе
-MAX_STRESS_WORKERS = 25      # Одновременные тесты для резерва (чтобы не забить канал)
+TARGET_ACTIVE_COUNT = 10     # Сколько серверов держать в Активе
+MAX_STRESS_WORKERS = 35      # Одновременные тесты для резерва (чтобы не забить канал)
 STRESS_TEST_DURATION = 25    # Секунд загрузки для прохождения стресс-теста
 
 # ─── ПОРТЫ И GEOIP ───────────────────────────────────────────────────────────
@@ -155,6 +155,7 @@ class GarantBalancer:
         self.untested_queue = Queue()
         self.lock = threading.Lock()
         self.seen_hosts = set()
+        self.max_queue_size = 1500
 
     def run_scraper(self):
         while True:
