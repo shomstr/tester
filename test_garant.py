@@ -5,6 +5,7 @@ import requests
 import traceback
 import logging
 import os
+import socket
 import urllib3
 from shop_bot.modules.key_checker import GarantBalancer, XRAY_BINARY
 

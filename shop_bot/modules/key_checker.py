@@ -23,10 +23,10 @@ VLESS_SOURCES = [
     "https://github.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/blob/main/vpn-lte/best_keys.txt",
     "https://github.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/blob/main/vpn-lte/good_keys.txt",
     "https://github.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/blob/main/vpn-lte/subscriptions/1sub.txt",
-    
+
 ]
 
-TARGET_ACTIVE_COUNT = 10     # Сколько серверов держать в Активе
+TARGET_ACTIVE_COUNT = 7     # Сколько серверов держать в Активе
 MAX_STRESS_WORKERS = 25      # Одновременные тесты для резерва (чтобы не забить канал)
 STRESS_TEST_DURATION = 60    # Секунд загрузки для прохождения стресс-теста
 
