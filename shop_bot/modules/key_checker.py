@@ -9,6 +9,7 @@ import tempfile
 import subprocess
 import threading
 import random
+import concurrent.futures
 from queue import Queue
 from urllib.parse import unquote, parse_qs
 
@@ -25,7 +26,7 @@ VLESS_SOURCES = [
     "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/Splitted-By-Protocol/vless.txt",
     "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/vless_configs.txt",
     "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/filtered/subs/vless.txt",
-    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",  # очень большой
+    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",  
     "https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt",
 ]
 
@@ -33,7 +34,9 @@ TARGET_ACTIVE_COUNT = 10
 MAX_RESERVE_COUNT = 25
 MAX_STRESS_WORKERS = 40
 STRESS_TEST_DURATION = 22
-MIN_ACCEPTABLE_SPEED_MBPS = 18   # ← главный фикс "пустых пулов"
+
+# Снижено до 8 Mbps: идеально для стабильного пула. Хватит для YouTube 1080p и Telegram
+MIN_ACCEPTABLE_SPEED_MBPS = 8   
 
 SUPER_SPEED_MBPS = 85
 SUPER_LOW_PING_MS = 280
@@ -75,7 +78,7 @@ def _find_xray_binary() -> str | None:
 
 XRAY_BINARY = _find_xray_binary()
 
-# ==================== УЛУЧШЕННЫЙ ПАРСЕР VLESS ====================
+# ==================== ПАРСЕР VLESS ====================
 def _parse_vless_to_xray_config(link: str, socks_port: int) -> dict | None:
     try:
         link = link.split('#')[0].strip()
@@ -290,29 +293,55 @@ class GarantBalancer:
 
             self.untested_queue.task_done()
 
+    def _check_single_proxy(self, p: ProxyInstance) -> tuple[ProxyInstance, bool]:
+        """Функция для параллельной проверки одного прокси"""
+        try:
+            # Используем безопасный эндпоинт Cloudflare. Быстро и без банов.
+            resp = requests.get("http://cp.cloudflare.com/generate_204", 
+                                proxies=p.get_proxies_dict(), 
+                                timeout=6)
+            
+            if resp.status_code == 204:
+                # Оставляем очень легкую нагрузку для поддержания соединения (15% шанс)
+                if random.random() < 0.15:
+                    with requests.get("https://speed.hetzner.de/50MB.bin", 
+                                      proxies=p.get_proxies_dict(), 
+                                      stream=True, 
+                                      timeout=7) as r:
+                        for _ in r.iter_content(64*1024):
+                            break # Скачали один чанк и вышли
+                return p, True
+            return p, False
+        except:
+            return p, False
+
     def run_health_watcher(self):
         while True:
             with self.lock:
                 active = list(self.active_pool)
 
-            alive = []
-            for p in active:
-                try:
-                    requests.get("https://api.telegram.org", proxies=p.get_proxies_dict(), timeout=7)
-                    # лёгкая нагрузка
-                    if random.random() < 0.25:
-                        with requests.get("https://speed.hetzner.de/50MB.bin", proxies=p.get_proxies_dict(), stream=True, timeout=12) as r:
-                            for _ in r.iter_content(64*1024):
-                                if random.random() < 0.15: break
-                    alive.append(p)
-                except:
-                    logger.warning(f"❌ Упал: {p.host}")
-                    p.stop()
+            alive_proxies = []
+            dead_proxies = []
+
+            # Параллельная проверка всего активного пула
+            with concurrent.futures.ThreadPoolExecutor(max_workers=TARGET_ACTIVE_COUNT) as executor:
+                results = executor.map(self._check_single_proxy, active)
+
+            for p, is_alive in results:
+                if is_alive:
+                    alive_proxies.append(p)
+                else:
+                    dead_proxies.append(p)
+
+            for p in dead_proxies:
+                logger.warning(f"❌ Упал и удален: {p.host}")
+                p.stop()
 
             with self.lock:
-                self.active_pool = [p for p in alive if p in self.active_pool]
+                # Очищаем мертвых из пула
+                self.active_pool = [p for p in alive_proxies if p in self.active_pool]
 
-                # Заполнение актива
+                # Заполнение актива из резерва
                 while len(self.active_pool) < TARGET_ACTIVE_COUNT and self.reserve_pool:
                     best = max(self.reserve_pool, key=lambda x: (x.speed_mbps, -x.ping_ms))
                     self.reserve_pool.remove(best)
@@ -351,7 +380,7 @@ class GarantBalancer:
         for _ in range(MAX_STRESS_WORKERS):
             threading.Thread(target=self._stress_test_worker, daemon=True).start()
         threading.Thread(target=self.run_health_watcher, daemon=True).start()
-        logger.info("🚀 Garant Balancer v2 (улучшенный) запущен")
+        logger.info("🚀 Garant Balancer v2 (Parallel Ready) запущен")
 
 
 # ====================== MAIN ======================
@@ -365,5 +394,6 @@ if __name__ == "__main__":
     balancer = GarantBalancer()
     balancer.start()
 
+    # Имитация работы основного потока
     while True:
         time.sleep(60)
