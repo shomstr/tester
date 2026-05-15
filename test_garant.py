@@ -60,15 +60,18 @@ def reporter_loop():
                     logger.info("✅ Успешно обновлено на сервере!")
                 else:
                     logger.error(f"❌ Ошибка отправки: HTTP {response.status_code} - {response.text}")
+                
+                # Если серверы есть и отправлены, ждем 3 минуты до следующего обновления
+                time.sleep(180)
             else:
                 logger.warning("Ожидание серверов... (Пулы пусты, идет стресс-тест)")
+                # Если серверов еще нет, проверяем каждые 15 секунд, чтобы отправить их как можно быстрее
+                time.sleep(15)
 
         except Exception as e:
             logger.error(f"❌ Критическая ошибка в цикле: {e}")
             traceback.print_exc()
-
-        # Ожидание перед следующей отправкой отчета на основной сервер
-        time.sleep(180) 
+            time.sleep(30)
 
 if __name__ == "__main__":
     import socket

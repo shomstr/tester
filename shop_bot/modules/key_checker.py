@@ -17,19 +17,25 @@ logger = logging.getLogger(__name__)
 # ─── КОНФИГУРАЦИЯ ────────────────────────────────────────────────────────────
 VLESS_SOURCES = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
-    "https://github.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/blob/main/vpn-lte/best_keys.txt",
-    "https://github.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/blob/main/vpn-lte/good_keys.txt",
-    "https://github.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/blob/main/vpn-lte/subscriptions/1sub.txt",
+    "https://raw.githubusercontent.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/main/vpn-lte/best_keys.txt",
+    "https://raw.githubusercontent.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/main/vpn-lte/good_keys.txt",
+    "https://raw.githubusercontent.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/main/vpn-lte/subscriptions/1sub.txt",
+    "https://raw.githubusercontent.com/BioniSec/vless-freesub/main/sub",
+    "https://raw.githubusercontent.com/tbbatbb/Proxy/master/main/vless",
+    "https://raw.githubusercontent.com/Lexiie/allfree/main/vless",
+    "https://raw.githubusercontent.com/ImanMontajabi/v2ray-custom-config/main/vless",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/VLESS_RAW.txt"
 ]
 
-TARGET_ACTIVE_COUNT = 12
-MAX_STRESS_WORKERS = 40
+TARGET_ACTIVE_COUNT = 10
+MAX_RESERVE_COUNT = 15
+MAX_STRESS_WORKERS = 20
 STRESS_TEST_DURATION = 35
-MIN_ACCEPTABLE_SPEED_MBPS = 55
+MIN_ACCEPTABLE_SPEED_MBPS = 40
 
 # Пороги для "Супер Гарант ⚡"
-SUPER_SPEED_MBPS = 130
-SUPER_LOW_PING_MS = 180
+SUPER_SPEED_MBPS = 100
+SUPER_LOW_PING_MS = 200
 
 # ─── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────
 _port_counter_lock = threading.Lock()
@@ -207,7 +213,6 @@ class GarantBalancer:
 
             logger.info(f"[Scraper] В очередь добавлено {new_count} новых хостов. В очереди: {self.untested_queue.qsize()}")
 
-            # Очистка очереди
             while self.untested_queue.qsize() > self.max_queue_size:
                 try:
                     self.untested_queue.get_nowait()
@@ -218,17 +223,28 @@ class GarantBalancer:
             time.sleep(600)
 
     def _stress_test_worker(self):
+        test_urls = [
+            "https://speed.hetzner.de/100MB.bin",
+            "https://speed.hetzner.de/1GB.bin",
+            "https://sabnzbd.org/tests/internetspeed/20MB.bin"
+        ]
         while True:
             link = self.untested_queue.get()
-            instance = ProxyInstance(link)
             
+            # Don't test if reserve is already full to save CPU
+            with self.lock:
+                if len(self.reserve_pool) >= MAX_RESERVE_COUNT:
+                    self.untested_queue.task_done()
+                    time.sleep(5)
+                    continue
+
+            instance = ProxyInstance(link)
             if not instance.start():
                 instance.stop()
                 self.untested_queue.task_done()
                 continue
 
-            # Стресс-тест
-            test_url = "https://speed.hetzner.de/100MB.bin"
+            test_url = random.choice(test_urls)
             start_time = time.time()
             downloaded = 0
             is_stable = False
@@ -236,8 +252,9 @@ class GarantBalancer:
             try:
                 with requests.get(test_url, proxies=instance.get_proxies_dict(), stream=True, timeout=12) as r:
                     r.raise_for_status()
-                    for chunk in r.iter_content(chunk_size=65536):
+                    for chunk in r.iter_content(chunk_size=131072):
                         if not chunk:
+                            is_stable = True  # File fully downloaded, so it is stable
                             break
                         downloaded += len(chunk)
                         elapsed = time.time() - start_time
@@ -245,16 +262,19 @@ class GarantBalancer:
                         if elapsed >= STRESS_TEST_DURATION:
                             is_stable = True
                             break
-                        if elapsed > 12 and (downloaded / elapsed / 125000) < 30:
+                        
+                        # Fast fail for very slow connections after 12 seconds
+                        if elapsed > 12 and (downloaded / elapsed / 125000) < 15:
                             break
             except Exception:
                 pass
 
-            if is_stable:
-                speed_mbps = (downloaded / (time.time() - start_time)) / 125000
+            elapsed = time.time() - start_time
+            if downloaded > 0 and elapsed > 0:
+                speed_mbps = (downloaded / elapsed) / 125000
                 instance.speed_mbps = speed_mbps
                 
-                if speed_mbps >= MIN_ACCEPTABLE_SPEED_MBPS:
+                if is_stable and speed_mbps >= MIN_ACCEPTABLE_SPEED_MBPS:
                     try:
                         ip = socket.gethostbyname(instance.host)
                         instance.cc, instance.flag = _get_country(ip)
@@ -264,11 +284,24 @@ class GarantBalancer:
                     instance.ping_ms = (time.time() - start_time) * 1000 / STRESS_TEST_DURATION
                     instance.is_super = (speed_mbps >= SUPER_SPEED_MBPS and instance.ping_ms <= SUPER_LOW_PING_MS)
                     
+                    added = False
                     with self.lock:
-                        self.reserve_pool.append(instance)
-                    
-                    super_mark = "⚡ " if instance.is_super else ""
-                    logger.info(f"✅ {super_mark}Гарант+ {instance.flag} {instance.cc} | {speed_mbps:.1f} Mbps | {instance.host}")
+                        if len(self.reserve_pool) < MAX_RESERVE_COUNT:
+                            self.reserve_pool.append(instance)
+                            added = True
+                        else:
+                            worst_reserve = min(self.reserve_pool, key=lambda x: x.speed_mbps)
+                            if speed_mbps > worst_reserve.speed_mbps:
+                                self.reserve_pool.remove(worst_reserve)
+                                worst_reserve.stop()
+                                self.reserve_pool.append(instance)
+                                added = True
+                                
+                    if added:
+                        super_mark = "⚡ " if instance.is_super else ""
+                        logger.info(f"✅ {super_mark}Гарант+ {instance.flag} {instance.cc} | {speed_mbps:.1f} Mbps | {instance.host}")
+                    else:
+                        instance.stop()
                 else:
                     instance.stop()
             else:
@@ -279,25 +312,59 @@ class GarantBalancer:
     def run_health_watcher(self):
         while True:
             with self.lock:
-                alive_active = []
-                for p in self.active_pool[:]:
-                    try:
-                        start = time.time()
-                        requests.get("https://api.telegram.org", proxies=p.get_proxies_dict(), timeout=5)
-                        p.ping_ms = (time.time() - start) * 1000
-                        alive_active.append(p)
-                    except:
-                        logger.warning(f"❌ Упал: {p.host}")
-                        p.stop()
-                
-                self.active_pool = alive_active
+                current_active = list(self.active_pool)
+                current_reserve = list(self.reserve_pool)
 
-                while len(self.active_pool) < TARGET_ACTIVE_COUNT and self.reserve_pool:
-                    new_server = self.reserve_pool.pop(0)
-                    self.active_pool.append(new_server)
-                    logger.info(f"🔄 Добавлен в актив: {new_server.host}")
+            alive_active = []
+            for p in current_active:
+                try:
+                    start = time.time()
+                    requests.get("https://api.telegram.org", proxies=p.get_proxies_dict(), timeout=5)
+                    p.ping_ms = (time.time() - start) * 1000
+                    
+                    # Periodic load simulation (Telegram Media Upload equivalent)
+                    # 1 in 4 chance every 20 seconds to run a 5-second download burst
+                    if random.random() < 0.25:
+                        with requests.get("https://speed.hetzner.de/100MB.bin", proxies=p.get_proxies_dict(), stream=True, timeout=8) as r:
+                            r.raise_for_status()
+                            downloaded = 0
+                            t0 = time.time()
+                            for chunk in r.iter_content(chunk_size=65536):
+                                if not chunk: break
+                                downloaded += len(chunk)
+                                if time.time() - t0 > 5:
+                                    break
+                            if downloaded < 2_000_000: # Needs to download at least ~3.2 Mbps sustained
+                                raise Exception("Connection dropped/slow under media load")
+
+                    alive_active.append(p)
+                except Exception as e:
+                    logger.warning(f"❌ Сервер упал под нагрузкой: {p.host} ({e})")
+                    p.stop()
             
-            time.sleep(15)
+            with self.lock:
+                # Keep active ones that survived, dropping those that failed
+                self.active_pool = [p for p in alive_active if p in self.active_pool]
+
+                # Refill active pool from reserve
+                while len(self.active_pool) < TARGET_ACTIVE_COUNT and self.reserve_pool:
+                    best_reserve = max(self.reserve_pool, key=lambda x: x.speed_mbps)
+                    self.reserve_pool.remove(best_reserve)
+                    self.active_pool.append(best_reserve)
+                    logger.info(f"🔄 Добавлен в актив из резерва: {best_reserve.host} ({best_reserve.speed_mbps:.1f} Mbps)")
+                
+                # Smart balancing: periodically replace the worst active with a much better reserve
+                if len(self.active_pool) == TARGET_ACTIVE_COUNT and self.reserve_pool:
+                    worst_active = min(self.active_pool, key=lambda x: x.speed_mbps)
+                    best_reserve = max(self.reserve_pool, key=lambda x: x.speed_mbps)
+                    if best_reserve.speed_mbps > worst_active.speed_mbps * 1.5:  # 50% better
+                        logger.info(f"♻️ Ротация: Замена {worst_active.host} ({worst_active.speed_mbps:.1f} Mbps) на {best_reserve.host} ({best_reserve.speed_mbps:.1f} Mbps)")
+                        self.active_pool.remove(worst_active)
+                        worst_active.stop()
+                        self.reserve_pool.remove(best_reserve)
+                        self.active_pool.append(best_reserve)
+            
+            time.sleep(20)
 
     def get_api_payload(self) -> list[dict]:
         with self.lock:
