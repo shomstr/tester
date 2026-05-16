@@ -327,13 +327,23 @@ class GarantBalancer:
     def _check_single_proxy(self, p: ProxyInstance) -> tuple[ProxyInstance, bool]:
         """Функция для параллельной проверки одного прокси"""
         try:
-            # Используем безопасный эндпоинт Cloudflare. Быстро и без банов.
-            resp = requests.get("http://cp.cloudflare.com/generate_204", 
+            # Строгая проверка: скачиваем 256 КБ реальных данных. 
+            # DPI часто пропускают "рукопожатие" (handshake) и легкие пакеты, 
+            # но обрывают соединение при реальной передаче.
+            resp = requests.get("https://speed.cloudflare.com/__down?bytes=262144", 
                                 proxies=p.get_proxies_dict(), 
-                                timeout=8)
+                                timeout=12,
+                                stream=True)
             
-            if resp.status_code == 204:
-                return p, True
+            if resp.status_code == 200:
+                downloaded = 0
+                for chunk in resp.iter_content(32*1024):
+                    if chunk:
+                        downloaded += len(chunk)
+                
+                # Если скачался весь объем, значит трафик ходит исправно
+                if downloaded >= 250000:
+                    return p, True
             return p, False
         except:
             return p, False
