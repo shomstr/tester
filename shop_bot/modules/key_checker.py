@@ -28,6 +28,13 @@ VLESS_SOURCES = [
     "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/filtered/subs/vless.txt",
     "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",  
     "https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt",
+
+    # Новые источники для большего количества вариаций
+    "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/sub.txt",
+    "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
+    "https://raw.githubusercontent.com/w1770946466/Auto_proxy/main/Long_term_subscription",
+    "https://raw.githubusercontent.com/yebekhe/TVC/main/subscriptions/xray/base64/mix",
+    "https://raw.githubusercontent.com/soroushmirzaei/telegram-configs-collector/main/protocols/vless",
 ]
 
 TARGET_ACTIVE_COUNT = 10
@@ -152,6 +159,7 @@ class ProxyInstance:
         self.port = _get_next_port()
         self.process = None
         self.cfg_file = None
+        self.stop_event = threading.Event()
         
         m = re.search(r'@([^:]+):(\d+)', self.base_link)
         self.host = m.group(1) if m else "unknown"
@@ -173,9 +181,32 @@ class ProxyInstance:
         self.process = subprocess.Popen([XRAY_BINARY, 'run', '-c', self.cfg_file],
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1.2)
-        return self.process.poll() is None
+        if self.process.poll() is None:
+            threading.Thread(target=self._background_load_loop, daemon=True).start()
+            return True
+        return False
+
+    def _background_load_loop(self):
+        urls = [
+            "https://speed.hetzner.de/100MB.bin",
+            "https://sabnzbd.org/tests/internetspeed/20MB.bin",
+            "https://proof.ovh.net/files/10Mb.dat"
+        ]
+        while not self.stop_event.is_set():
+            try:
+                url = random.choice(urls)
+                with requests.get(url, proxies=self.get_proxies_dict(), stream=True, timeout=12) as r:
+                    if r.status_code == 200:
+                        for chunk in r.iter_content(32*1024):
+                            if self.stop_event.is_set():
+                                break
+                            if chunk:
+                                time.sleep(0.5) 
+            except Exception:
+                time.sleep(2)
 
     def stop(self):
+        self.stop_event.set()
         if self.process:
             try:
                 self.process.terminate()
@@ -299,17 +330,9 @@ class GarantBalancer:
             # Используем безопасный эндпоинт Cloudflare. Быстро и без банов.
             resp = requests.get("http://cp.cloudflare.com/generate_204", 
                                 proxies=p.get_proxies_dict(), 
-                                timeout=6)
+                                timeout=8)
             
             if resp.status_code == 204:
-                # Оставляем очень легкую нагрузку для поддержания соединения (15% шанс)
-                if random.random() < 0.15:
-                    with requests.get("https://speed.hetzner.de/50MB.bin", 
-                                      proxies=p.get_proxies_dict(), 
-                                      stream=True, 
-                                      timeout=7) as r:
-                        for _ in r.iter_content(64*1024):
-                            break # Скачали один чанк и вышли
                 return p, True
             return p, False
         except:
@@ -319,13 +342,15 @@ class GarantBalancer:
         while True:
             with self.lock:
                 active = list(self.active_pool)
+                reserve = list(self.reserve_pool)
 
+            all_to_check = active + reserve
             alive_proxies = []
             dead_proxies = []
 
             # Параллельная проверка всего активного пула
-            with concurrent.futures.ThreadPoolExecutor(max_workers=TARGET_ACTIVE_COUNT) as executor:
-                results = executor.map(self._check_single_proxy, active)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(all_to_check) or 1) as executor:
+                results = executor.map(self._check_single_proxy, all_to_check)
 
             for p, is_alive in results:
                 if is_alive:
@@ -340,6 +365,7 @@ class GarantBalancer:
             with self.lock:
                 # Очищаем мертвых из пула
                 self.active_pool = [p for p in alive_proxies if p in self.active_pool]
+                self.reserve_pool = [p for p in alive_proxies if p in self.reserve_pool]
 
                 # Заполнение актива из резерва
                 while len(self.active_pool) < TARGET_ACTIVE_COUNT and self.reserve_pool:
